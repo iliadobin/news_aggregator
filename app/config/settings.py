@@ -5,14 +5,30 @@ This module uses Pydantic Settings to load and validate configuration from envir
 All settings are validated at startup time.
 """
 
-from typing import Literal, Optional
 from pathlib import Path
+from typing import Any, Literal, Optional
 
-from pydantic import Field, PostgresDsn, field_validator
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
-class DatabaseSettings(BaseSettings):
+class EnvBaseSettings(BaseSettings):
+    """
+    Base class for settings sections.
+
+    Important: nested settings are instantiated independently (via default_factory),
+    so each section must know how to load from `.env` as well.
+    """
+
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        case_sensitive=False,
+        extra="ignore",
+    )
+
+
+class DatabaseSettings(EnvBaseSettings):
     """Database connection settings."""
 
     host: str = Field(default="localhost", description="PostgreSQL host")
@@ -29,13 +45,19 @@ class DatabaseSettings(BaseSettings):
         """Construct PostgreSQL DSN."""
         return f"postgresql+asyncpg://{self.user}:{self.password}@{self.host}:{self.port}/{self.database}"
 
-    model_config = SettingsConfigDict(env_prefix="DB_", case_sensitive=False)
+    model_config = SettingsConfigDict(
+        env_prefix="DB_",
+        case_sensitive=False,
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
 
 
-class TelegramBotSettings(BaseSettings):
+class TelegramBotSettings(EnvBaseSettings):
     """Telegram bot settings (classic bot for control)."""
 
-    token: str = Field(description="Telegram bot token")
+    token: Optional[str] = Field(default=None, description="Telegram bot token")
     admin_ids: list[int] = Field(
         default_factory=list, description="List of admin Telegram user IDs"
     )
@@ -44,33 +66,98 @@ class TelegramBotSettings(BaseSettings):
 
     @field_validator("token")
     @classmethod
-    def validate_token(cls, v: str) -> str:
-        """Validate that token is not empty."""
-        if not v or v.strip() == "":
-            raise ValueError("Telegram bot token cannot be empty")
+    def normalize_token(cls, v: Optional[str]) -> Optional[str]:
+        """Normalize token. Token becomes required only when bot is started."""
+        if v is None:
+            return None
+        v = v.strip()
+        return v or None
+
+    @field_validator("admin_ids", mode="before")
+    @classmethod
+    def parse_admin_ids(cls, v: Any) -> Any:
+        """
+        Parse admin IDs from common env formats.
+
+        Supported:
+        - list[int] (already parsed)
+        - JSON list string: "[1,2,3]"
+        - comma-separated: "1,2,3"
+        - empty string -> []
+        """
+        if v is None:
+            return []
+        if isinstance(v, list):
+            return v
+        if isinstance(v, str):
+            s = v.strip()
+            if s == "":
+                return []
+            if s.startswith("[") and s.endswith("]"):
+                import json
+
+                parsed = json.loads(s)
+                if isinstance(parsed, list):
+                    return parsed
+            parts = [p.strip() for p in s.split(",") if p.strip() != ""]
+            return [int(p) for p in parts]
         return v
 
-    model_config = SettingsConfigDict(env_prefix="BOT_", case_sensitive=False)
+    model_config = SettingsConfigDict(
+        env_prefix="BOT_",
+        case_sensitive=False,
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
 
 
-class TelegramUserBotSettings(BaseSettings):
+class TelegramUserBotSettings(EnvBaseSettings):
     """Telegram user bot settings (for reading messages from sources)."""
 
-    api_id: int = Field(description="Telegram API ID")
-    api_hash: str = Field(description="Telegram API Hash")
-    phone: str = Field(description="Phone number for user bot")
+    api_id: Optional[int] = Field(default=None, description="Telegram API ID")
+    api_hash: Optional[str] = Field(default=None, description="Telegram API Hash")
+    phone: Optional[str] = Field(default=None, description="Phone number for user bot")
     session_name: str = Field(default="news_aggregator_userbot", description="Session name")
     session_dir: Path = Field(
         default=Path("sessions"), description="Directory to store session files"
     )
 
+    @field_validator("api_id", mode="before")
+    @classmethod
+    def parse_api_id(cls, v: Any) -> Any:
+        """Allow missing/blank api_id; require it only when user-bot is started."""
+        if v is None:
+            return None
+        if isinstance(v, int):
+            return v
+        if isinstance(v, str):
+            s = v.strip()
+            if s == "":
+                return None
+            if s.isdigit():
+                return int(s)
+            # placeholder / invalid value -> treat as not configured
+            return None
+        return v
+
     @field_validator("api_hash")
     @classmethod
-    def validate_api_hash(cls, v: str) -> str:
-        """Validate that API hash is not empty."""
-        if not v or v.strip() == "":
-            raise ValueError("Telegram API hash cannot be empty")
-        return v
+    def normalize_api_hash(cls, v: Optional[str]) -> Optional[str]:
+        """Normalize API hash; require it only when user-bot is started."""
+        if v is None:
+            return None
+        v = v.strip()
+        return v or None
+
+    @field_validator("phone")
+    @classmethod
+    def normalize_phone(cls, v: Optional[str]) -> Optional[str]:
+        """Normalize phone; require it only when user-bot is started."""
+        if v is None:
+            return None
+        v = v.strip()
+        return v or None
 
     @field_validator("session_dir")
     @classmethod
@@ -79,10 +166,16 @@ class TelegramUserBotSettings(BaseSettings):
         v.mkdir(parents=True, exist_ok=True)
         return v
 
-    model_config = SettingsConfigDict(env_prefix="USERBOT_", case_sensitive=False)
+    model_config = SettingsConfigDict(
+        env_prefix="USERBOT_",
+        case_sensitive=False,
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
 
 
-class FilterSettings(BaseSettings):
+class FilterSettings(EnvBaseSettings):
     """Filtering engine settings."""
 
     enable_keyword: bool = Field(default=True, description="Enable keyword filtering")
@@ -101,10 +194,16 @@ class FilterSettings(BaseSettings):
         default=4096, description="Maximum message length to process (chars)"
     )
 
-    model_config = SettingsConfigDict(env_prefix="FILTER_", case_sensitive=False)
+    model_config = SettingsConfigDict(
+        env_prefix="FILTER_",
+        case_sensitive=False,
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
 
 
-class LoggingSettings(BaseSettings):
+class LoggingSettings(EnvBaseSettings):
     """Logging configuration."""
 
     level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = Field(
@@ -127,10 +226,16 @@ class LoggingSettings(BaseSettings):
             v.parent.mkdir(parents=True, exist_ok=True)
         return v
 
-    model_config = SettingsConfigDict(env_prefix="LOG_", case_sensitive=False)
+    model_config = SettingsConfigDict(
+        env_prefix="LOG_",
+        case_sensitive=False,
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
 
 
-class AppSettings(BaseSettings):
+class AppSettings(EnvBaseSettings):
     """Main application settings."""
 
     environment: Literal["development", "production", "testing"] = Field(
@@ -139,25 +244,28 @@ class AppSettings(BaseSettings):
     debug: bool = Field(default=False, description="Debug mode")
     timezone: str = Field(default="UTC", description="Default timezone")
 
-    model_config = SettingsConfigDict(env_prefix="APP_", case_sensitive=False)
+    model_config = SettingsConfigDict(
+        env_prefix="APP_",
+        case_sensitive=False,
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
 
 
-class Settings(BaseSettings):
+class Settings(EnvBaseSettings):
     """Root settings class that aggregates all configuration sections."""
 
     app: AppSettings = Field(default_factory=AppSettings)
     database: DatabaseSettings = Field(default_factory=DatabaseSettings)
-    bot: TelegramBotSettings = Field(default_factory=TelegramBotSettings)
-    userbot: TelegramUserBotSettings = Field(default_factory=TelegramUserBotSettings)
+    # Telegram settings are intentionally lazy / optional at bootstrap time.
+    # They should be instantiated by the bot runners when needed.
+    bot: Optional[TelegramBotSettings] = Field(default=None)
+    userbot: Optional[TelegramUserBotSettings] = Field(default=None)
     filter: FilterSettings = Field(default_factory=FilterSettings)
     logging: LoggingSettings = Field(default_factory=LoggingSettings)
 
-    model_config = SettingsConfigDict(
-        env_file=".env",
-        env_file_encoding="utf-8",
-        case_sensitive=False,
-        extra="ignore",
-    )
+    # model_config inherited from EnvBaseSettings
 
 
 # Singleton instance of settings
@@ -189,3 +297,13 @@ def reload_settings() -> Settings:
     global _settings
     _settings = Settings()
     return _settings
+
+
+def get_bot_settings() -> TelegramBotSettings:
+    """Load Telegram control-bot settings (token/admins)."""
+    return TelegramBotSettings()
+
+
+def get_userbot_settings() -> TelegramUserBotSettings:
+    """Load Telegram user-bot settings (api_id/api_hash/phone/session)."""
+    return TelegramUserBotSettings()
