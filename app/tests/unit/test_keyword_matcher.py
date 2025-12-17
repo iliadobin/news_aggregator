@@ -100,6 +100,11 @@ class TestMatchKeywordInTokens:
         assert match_keyword_in_tokens(tokens, "test") is True
         assert match_keyword_in_tokens(tokens, "missing") is False
 
+    def test_single_word_multiple_occurrences(self) -> None:
+        """Test matching when token appears multiple times."""
+        tokens = ["python", "is", "python", "python"]
+        assert match_keyword_in_tokens(tokens, "python") is True
+
     def test_multi_word_match(self) -> None:
         """Test multi-word phrase matching."""
         tokens = ["python", "is", "a", "great", "language"]
@@ -107,6 +112,11 @@ class TestMatchKeywordInTokens:
         assert match_keyword_in_tokens(tokens, "great language") is True
         assert match_keyword_in_tokens(tokens, "is a great") is True
         assert match_keyword_in_tokens(tokens, "python language") is False  # Not consecutive
+
+    def test_multi_word_multiple_occurrences(self) -> None:
+        """Test matching when phrase occurs multiple times."""
+        tokens = ["a", "b", "a", "b", "a", "b"]
+        assert match_keyword_in_tokens(tokens, "a b") is True
 
     def test_case_sensitivity(self) -> None:
         """Test case sensitivity in token matching."""
@@ -200,6 +210,33 @@ class TestMatchKeywordsInText:
 
         match = match_keywords_in_text("test", [])
         assert match.has_match is False
+
+    def test_match_count_consistent_between_partial_and_token_strategies(self) -> None:
+        """
+        Regression: match_count should count total occurrences, regardless of strategy.
+
+        Previously, token-based matching incremented match_count by 1 per keyword even if it
+        appeared multiple times, while partial matching counted actual occurrences.
+        """
+        text = "python python python"
+        keywords = ["python"]
+        normalized = NormalizedText(
+            original=text,
+            normalized=text,
+            tokens=["python", "python", "python"],
+            language="en",
+            lemmas=["python", "python", "python"],
+        )
+
+        partial_opts = KeywordOptions(case_sensitive=False, whole_word=False, use_lemmatization=False)
+        token_opts = KeywordOptions(case_sensitive=False, whole_word=True, use_lemmatization=False)
+
+        partial_match = match_keywords_in_text(text, keywords, options=partial_opts, normalized_text=normalized)
+        token_match = match_keywords_in_text(text, keywords, options=token_opts, normalized_text=normalized)
+
+        assert partial_match.match_count == 3
+        # token-based strategy counts presence per keyword (not occurrences)
+        assert token_match.match_count == 1
 
 
 class TestMatchFilterKeywords:

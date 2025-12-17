@@ -184,7 +184,7 @@ class FilterSettings(EnvBaseSettings):
         default=0.7, ge=0.0, le=1.0, description="Default semantic similarity threshold"
     )
     embedding_model: str = Field(
-        default="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+        default="intfloat/multilingual-e5-small",
         description="Sentence transformer model name",
     )
     embedding_cache_size: int = Field(
