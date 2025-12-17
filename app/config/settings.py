@@ -180,11 +180,18 @@ class FilterSettings(EnvBaseSettings):
 
     enable_keyword: bool = Field(default=True, description="Enable keyword filtering")
     enable_semantic: bool = Field(default=True, description="Enable semantic filtering")
+    semantic_backend: str = Field(
+        default="embeddings",
+        description=(
+            "Semantic matching backend. "
+            "Supported: 'embeddings' (sentence-transformers/HF) or 'tfidf' (local TF-IDF cosine)."
+        ),
+    )
     semantic_threshold: float = Field(
         default=0.7, ge=0.0, le=1.0, description="Default semantic similarity threshold"
     )
     embedding_model: str = Field(
-        default="intfloat/multilingual-e5-small",
+        default="sentence-transformers/paraphrase-MiniLM-L3-v2",
         description="Sentence transformer model name",
     )
     embedding_cache_size: int = Field(

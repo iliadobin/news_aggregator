@@ -13,7 +13,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 from sqlalchemy.exc import ProgrammingError
@@ -97,6 +97,17 @@ def _message_metadata(msg: TgMessage) -> dict[str, Any]:
     return meta
 
 
+def _to_naive_utc(dt: datetime) -> datetime:
+    """
+    Convert datetime to naive UTC.
+
+    Telethon provides timezone-aware UTC datetimes; our DB column is TIMESTAMP WITHOUT TIME ZONE.
+    """
+    if dt.tzinfo is None:
+        return dt
+    return dt.astimezone(timezone.utc).replace(tzinfo=None)
+
+
 async def telegram_event_to_incoming(event: events.NewMessage.Event) -> IncomingMessage:
     msg: TgMessage = event.message
     chat = event.chat
@@ -110,7 +121,7 @@ async def telegram_event_to_incoming(event: events.NewMessage.Event) -> Incoming
     chat_id = int(event.chat_id) if event.chat_id is not None else int(msg.peer_id.channel_id)  # type: ignore[attr-defined]
 
     text = getattr(msg, "raw_text", None) or getattr(msg, "message", None)
-    date: datetime = msg.date  # timezone-aware datetime from Telethon
+    date: datetime = _to_naive_utc(msg.date)  # DB expects naive datetime
 
     return IncomingMessage(
         telegram_message_id=int(msg.id),
@@ -220,4 +231,3 @@ def register_handlers(*, client: Any, source_cache: SourceCache) -> None:
         except Exception:
             # Always keep user-bot alive; log full traceback.
             logger.exception("Unhandled exception in user-bot message handler")
-

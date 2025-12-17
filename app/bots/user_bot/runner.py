@@ -14,12 +14,15 @@ from typing import Optional
 
 from sqlalchemy import text
 from sqlalchemy.exc import ProgrammingError
+from telethon.errors import FloodWaitError, UserAlreadyParticipantError
+from telethon.tl.functions.channels import JoinChannelRequest
 
 from app.config.settings import TelegramUserBotSettings, get_userbot_settings
 from app.infra.logging.config import setup_logging
 from app.bots.user_bot.client import create_userbot_client
 from app.bots.user_bot.handlers import SourceCache, register_handlers
 from app.infra.db.base import get_db_session
+from app.infra.db.repositories import SourceRepository
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +62,72 @@ async def run_userbot(settings: Optional[TelegramUserBotSettings] = None) -> Non
     register_handlers(client=client, source_cache=source_cache)
 
     refresh_task: Optional[asyncio.Task[object]] = None
+    join_task: Optional[asyncio.Task[object]] = None
+
+    async def _ensure_joined_sources_forever(*, interval_seconds: int = 120) -> None:
+        """
+        Periodically ensure the user-bot account is joined to all active sources from DB.
+
+        This is required for receiving new messages in channels/groups via updates.
+        """
+        # initial small delay to allow client.start() to complete
+        await asyncio.sleep(2)
+        while not stop_event.is_set():
+            try:
+                async with get_db_session() as session:
+                    repo = SourceRepository(session)
+                    sources = await repo.get_active_sources()
+
+                for s in sources:
+                    if stop_event.is_set():
+                        break
+                    ref: object
+                    username = getattr(s, "username", None)
+                    if username:
+                        ref = f"@{username}" if not str(username).startswith("@") else str(username)
+                    else:
+                        ref = int(s.telegram_chat_id)
+
+                    try:
+                        entity = await client.get_entity(ref)
+                        await client(JoinChannelRequest(entity))
+                        logger.info(
+                            "Joined source",
+                            extra={
+                                "extra_data": {
+                                    "source_id": int(s.id),
+                                    "telegram_chat_id": int(s.telegram_chat_id),
+                                    "username": username,
+                                }
+                            },
+                        )
+                    except UserAlreadyParticipantError:
+                        # Already joined; fine.
+                        continue
+                    except FloodWaitError as e:
+                        # Telegram rate limits joins. Respect it.
+                        seconds = int(getattr(e, "seconds", 30))
+                        logger.warning("FloodWait while joining sources; sleeping %s seconds", seconds)
+                        await asyncio.sleep(seconds)
+                    except Exception:
+                        logger.exception(
+                            "Failed to join source",
+                            extra={
+                                "extra_data": {
+                                    "source_id": int(getattr(s, "id", 0)),
+                                    "telegram_chat_id": int(getattr(s, "telegram_chat_id", 0)),
+                                    "username": username,
+                                }
+                            },
+                        )
+
+            except Exception:
+                logger.exception("Failed to ensure joined sources")
+
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=interval_seconds)
+            except asyncio.TimeoutError:
+                pass
 
     try:
         await client.start(phone=settings.phone)
@@ -93,6 +162,11 @@ async def run_userbot(settings: Optional[TelegramUserBotSettings] = None) -> Non
         )
         refresh_task.add_done_callback(lambda t: _log_task_result(t, name="source_refresh"))
 
+        join_task = asyncio.create_task(
+            _ensure_joined_sources_forever(interval_seconds=120), name="userbot_ensure_joined_sources"
+        )
+        join_task.add_done_callback(lambda t: _log_task_result(t, name="ensure_joined_sources"))
+
         await client.run_until_disconnected()
 
     except (KeyboardInterrupt, SystemExit):
@@ -103,6 +177,10 @@ async def run_userbot(settings: Optional[TelegramUserBotSettings] = None) -> Non
             refresh_task.cancel()
             with contextlib.suppress(Exception):
                 await refresh_task
+        if join_task is not None:
+            join_task.cancel()
+            with contextlib.suppress(Exception):
+                await join_task
         await client.disconnect()
         logger.info("User-bot disconnected")
 

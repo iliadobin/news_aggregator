@@ -8,6 +8,11 @@ using text embeddings and cosine similarity.
 import logging
 from typing import Optional
 
+import numpy as np
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+
+from app.config.settings import get_settings
 from app.domain.entities import (
     FilterConfig,
     FilterMode,
@@ -15,15 +20,70 @@ from app.domain.entities import (
     SemanticMatch,
     SemanticOptions,
 )
-from app.nlp.embeddings import (
-    compute_similarities,
-    compute_similarity,
-    encode_text,
-    encode_texts,
-    encode_texts_cached,
-)
+from app.nlp.embeddings import compute_similarities, compute_similarity, encode_text, encode_texts, encode_texts_cached
 
 logger = logging.getLogger(__name__)
+
+# ================================================================================
+# TF-IDF backend (local, no HF downloads)
+# ================================================================================
+
+
+_TFIDF_CACHE: dict[tuple[str, ...], tuple[TfidfVectorizer, "np.ndarray"]] = {}
+_TFIDF_CACHE_MAX = 128
+
+
+def _should_use_tfidf_backend() -> bool:
+    """
+    Decide semantic backend based on settings.
+
+    Returns:
+        True if TF-IDF backend should be used; otherwise embeddings backend is used.
+    """
+    backend = (get_settings().filter.semantic_backend or "embeddings").strip().lower()
+    return backend == "tfidf"
+
+
+def _tfidf_get_or_build(topics: list[str]) -> tuple[TfidfVectorizer, "np.ndarray"]:
+    """
+    Get cached TF-IDF vectorizer + topic matrix for given topics.
+
+    We fit vectorizer on topics only (stable + fast), then transform text at query time.
+    """
+    key = tuple(t.strip() for t in topics if t and t.strip())
+    cached = _TFIDF_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    # Char n-grams work reasonably for RU/EN and short texts without extra tokenization.
+    vectorizer = TfidfVectorizer(
+        analyzer="char_wb",
+        ngram_range=(3, 5),
+        lowercase=True,
+        min_df=1,
+    )
+    topic_matrix = vectorizer.fit_transform(list(key))
+
+    # Simple FIFO eviction to keep memory bounded.
+    if len(_TFIDF_CACHE) >= _TFIDF_CACHE_MAX:
+        first_key = next(iter(_TFIDF_CACHE))
+        del _TFIDF_CACHE[first_key]
+    _TFIDF_CACHE[key] = (vectorizer, topic_matrix)
+    return vectorizer, topic_matrix
+
+
+def _tfidf_similarities(text: str, topics: list[str]) -> "np.ndarray":
+    """
+    Compute cosine similarities between text and topics in TF-IDF space.
+    """
+    if not text or not topics:
+        return np.zeros((0,), dtype=np.float32)
+
+    vec, topic_matrix = _tfidf_get_or_build(topics)
+    text_vec = vec.transform([text])
+    sims = cosine_similarity(text_vec, topic_matrix).ravel()
+    # Cosine similarity can be 0..1 for non-negative TF-IDF, clip defensively.
+    return np.clip(sims.astype(np.float32), 0.0, 1.0)
 
 
 # ================================================================================
@@ -53,6 +113,12 @@ def match_text_to_topic(
         return False, 0.0
 
     try:
+        if _should_use_tfidf_backend():
+            sims = _tfidf_similarities(text, [topic])
+            similarity = float(sims[0]) if sims.size else 0.0
+            matched = similarity >= threshold
+            return matched, similarity
+
         # Get embeddings
         text_embedding = encode_text(text, use_cache=use_cache, normalize=True)
         topic_embedding = encode_text(topic, use_cache=use_cache, normalize=True)
@@ -104,16 +170,21 @@ def match_text_to_topics(
         )
 
     try:
-        # Get text embedding
-        text_embedding = encode_text(text, use_cache=use_cache, normalize=True)
+        if _should_use_tfidf_backend():
+            similarities = _tfidf_similarities(text, topics)
+        else:
+            # Get text embedding
+            text_embedding = encode_text(text, use_cache=use_cache, normalize=True)
 
-        # Get topic embeddings (cache-aware to avoid recomputing filter/topic embeddings)
-        topic_embeddings = (
-            encode_texts_cached(topics, normalize=True) if use_cache else encode_texts(topics, normalize=True)
-        )
+            # Get topic embeddings (cache-aware to avoid recomputing filter/topic embeddings)
+            topic_embeddings = (
+                encode_texts_cached(topics, normalize=True)
+                if use_cache
+                else encode_texts(topics, normalize=True)
+            )
 
-        # Compute similarities for all topics
-        similarities = compute_similarities(text_embedding, topic_embeddings)
+            # Compute similarities for all topics
+            similarities = compute_similarities(text_embedding, topic_embeddings)
 
         # Build results
         scores = {}
@@ -247,6 +318,30 @@ def match_texts_to_topics(
         ]
 
     try:
+        if _should_use_tfidf_backend():
+            # Build once per topics, then transform all texts.
+            vec, topic_matrix = _tfidf_get_or_build(topics)
+            text_matrix = vec.transform(texts)
+            sim_matrix = cosine_similarity(text_matrix, topic_matrix).astype(np.float32)
+            sim_matrix = np.clip(sim_matrix, 0.0, 1.0)
+
+            results: list[SemanticMatch] = []
+            for row in sim_matrix:
+                scores: dict[str, float] = {}
+                matched_topics: list[str] = []
+                max_score = 0.0
+                for topic, score in zip(topics, row):
+                    s = float(score)
+                    scores[topic] = s
+                    if s > max_score:
+                        max_score = s
+                    if s >= threshold:
+                        matched_topics.append(topic)
+                results.append(
+                    SemanticMatch(matched_topics=matched_topics, scores=scores, max_score=max_score)
+                )
+            return results
+
         # Encode all texts and topics in batches
         text_embeddings = encode_texts(
             texts, batch_size=batch_size, normalize=True, show_progress=len(texts) > 100
@@ -361,12 +456,15 @@ def find_similar_topics(
         return []
 
     try:
-        # Get embeddings
-        query_embedding = encode_text(query, normalize=True)
-        topic_embeddings = encode_texts(topics, normalize=True)
+        if _should_use_tfidf_backend():
+            similarities = _tfidf_similarities(query, topics)
+        else:
+            # Get embeddings
+            query_embedding = encode_text(query, normalize=True)
+            topic_embeddings = encode_texts(topics, normalize=True)
 
-        # Compute similarities
-        similarities = compute_similarities(query_embedding, topic_embeddings)
+            # Compute similarities
+            similarities = compute_similarities(query_embedding, topic_embeddings)
 
         # Create list of (topic, score) tuples
         results = [(topic, float(score)) for topic, score in zip(topics, similarities)]
